@@ -1,5 +1,5 @@
 {
     "python.defaultInterpreterPath": "venv/bin/python",
     "editor.formatOnSave": true,
-    "python.analysis.extraPaths": ["${workspaceFolder}/src/AgentSmith"]
+    // "python.analysis.extraPaths": ["${workspaceFolder}/src/AgentSmith"]
 }
