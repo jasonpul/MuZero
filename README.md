@@ -1,3 +1,3 @@
 # Learning MuZero Through Implementation
 
-I'll be writing a MuZero implementation from scratch using DeepMind's [pseudocode](https://arxiv.org/src/1911.08265v1/anc/pseudocode.py). I'll also be using [PyTorch](https://pytorch.org/) and testing the implementation using OpenAI's [LunarLanderContinuous-v2](https://gym.openai.com/envs/LunarLanderContinuous-v2/) environment. Cheers.
+A no-frills basic implementation of MuZero using [PyTorch](https://pytorch.org/). Currently, it is using naive search rather than monte carlo tree search similar to [gehot's](https://github.com/geohot/ai-notebooks) implementation. I think it's working on OpenAI's [CartPole-v1](https://gym.openai.com/envs/CartPole-v1/) environment. I'm working now to get the mcts implemented.
