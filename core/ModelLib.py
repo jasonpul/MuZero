@@ -1,148 +1,137 @@
-import numpy as np
+from __future__ import annotations
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import NamedTuple, List, Dict, Literal, Tuple, Union
-
-observation_size = 4
-action_space_size = 2
-low_observation = [-2.4, -2.0, -0.42, -3.5]
-high_observation = [2.4, 2.0, 0.42, 3.5]
+from typing import Optional, Tuple, List, NamedTuple, Dict, Literal
 
 ModelOutput = NamedTuple('ModelOutput', [('value', float), ('reward', float), (
     'policy', Dict[int, float]), ('encoded_state', List[float])])
 
 
+def scale_encoded_state(state: torch.Tensor):
+    # min_state = state.amin(dim=1, keepdim=True)
+    # max_state = state.amax(dim=1, keepdim=True)
+    # normalized_state = (state - min_state) / (max_state - min_state)
+    # return normalized_state
+    return state
+
+
 class DenseNetwork(nn.Module):
-    def __init__(self, input_size: int, hidden_sizes: List[int], output_size: int, hidden_activation=nn.ELU, output_activation=nn.Identity) -> None:
+    def __init__(self, input_size: int, hidden_sizes: List[int], outputs: List[int], hidden_activation=nn.ELU, output_activation=nn.Identity, dropout: Optional[float] = None) -> None:
         super().__init__()
+        dropout = dropout if dropout is not None else 0
 
         layers = [nn.Linear(input_size, hidden_sizes[0]), hidden_activation()]
         for i in range(len(hidden_sizes) - 1):
             layers += [nn.Linear(hidden_sizes[i],
-                                 hidden_sizes[i + 1]), hidden_activation()]
-        layers += [nn.Linear(hidden_sizes[-1], output_size),
-                   output_activation()]
+                                 hidden_sizes[i + 1]), hidden_activation(), nn.Dropout(p=dropout)]
+
         self.linear_stack = nn.Sequential(*layers)
+        self.output_layers = nn.ModuleList([nn.Sequential(
+            nn.Linear(hidden_sizes[-1], o), output_activation()) for o in outputs])
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         out = self.linear_stack(x)
+        out = [layer(out) for layer in self.output_layers]
+        if len(out) == 1:
+            return out[0]
         return out
 
 
-class Model(nn.Module):
-    def __init__(self, encoded_state_size: int, dynamics_hidden_sizes: List[int], prediction_hidden_sizes: List[int], representation_hidden_sizes: List[int], device: Literal['cpu', 'cuda']) -> None:
+class MuModel(nn.Module):
+    def __init__(self, observation_size: int, action_space_size: int, encoded_state_size: int, dynamics_hidden_sizes: List[int], prediction_hidden_sizes: List[int], representation_hidden_sizes: List[int], num_unroll: int, lr: float, dropout: Optional[float] = None, device: Literal['cpu', 'cuda'] = 'cpu') -> None:
         super().__init__()
-
+        self.observation_size = observation_size
+        self.action_space_size = action_space_size
         self.encoded_state_size = encoded_state_size
-        self.dynamics_hidden_sizes = dynamics_hidden_sizes
-        self.prediction_hidden_sizes = prediction_hidden_sizes
-        self.representation_hidden_sizes = representation_hidden_sizes
+        self.num_unroll = num_unroll
+        self.lr = lr
         self.device = device
 
         self.representation_network = DenseNetwork(
-            observation_size, representation_hidden_sizes, encoded_state_size).to(device)
-        self.prediction_network = DenseNetwork(
-            encoded_state_size, prediction_hidden_sizes, action_space_size + 1).to(device)
+            input_size=observation_size,
+            hidden_sizes=representation_hidden_sizes,
+            outputs=[encoded_state_size],
+            dropout=dropout
+        )
         self.dynamics_network = DenseNetwork(
-            encoded_state_size + action_space_size, dynamics_hidden_sizes, encoded_state_size + 1).to(device)
+            input_size=encoded_state_size + action_space_size,
+            hidden_sizes=dynamics_hidden_sizes,
+            outputs=[1, encoded_state_size],
 
+            dropout=dropout
+        )
+        self.prediction_network = DenseNetwork(
+            input_size=encoded_state_size,
+            hidden_sizes=prediction_hidden_sizes,
+            outputs=[action_space_size, 1],
+
+            dropout=dropout
+        )
+
+        self.to(device)
         self.eval()
 
-    def encode_observation(self, observation: Union[torch.Tensor, np.ndarray]) -> torch.Tensor:
-        if not torch.is_tensor(observation):
-            observation = torch.from_numpy(
-                observation.astype(np.float32)).to(self.device)
+    def encode_state(self, observation: torch.Tensor) -> torch.Tensor:
         encoded_state = self.representation_network(observation)
-        return encoded_state
+        scaled_encoded_state = scale_encoded_state(encoded_state)
+        return scaled_encoded_state
 
-    def process_prediction(self, prediction: torch.Tensor, train: bool):
-        policy, value = prediction[:, :-1], prediction[:, -1:]
-        if train:
-            policy_exp = policy.exp()
-            policy_logits = policy_exp / policy_exp.sum()
-            return policy_logits, value
-        else:
-            return policy.detach().numpy(), value.detach().numpy()
-
-    def _initial_inference(self, observation: Union[torch.Tensor, np.ndarray], train: bool) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        encoded_state = self.encode_observation(observation)
-        prediction = self.prediction_network(encoded_state)
-        policy, value = self.process_prediction(prediction, train)
-        return policy, value, encoded_state
-
-    def _recurrent_inference(self, encoded_state: torch.Tensor, action: Union[torch.Tensor, np.ndarray], train: bool) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        if not torch.is_tensor(action):
-            action = torch.from_numpy(action.astype(np.float32))
-        dynamics_input = torch.cat([encoded_state.T, action.T]).T
-        dynamics = self.dynamics_network(dynamics_input)
-        prediction = self.prediction_network(encoded_state)
-
-        reward, next_encoded_state = dynamics[:, -1:], dynamics[:, :-1]
-        policy, value = self.process_prediction(prediction, train)
-
-        return reward, next_encoded_state, policy, value
-
-    def initial_inference(self, observation: np.ndarray, train: bool = False) -> ModelOutput:
-        if train:
-            policy, value, encoded_state = self._initial_inference(
-                observation, True)
-        else:
-            with torch.no_grad():
-                policy, value, encoded_state = self._initial_inference(
-                    observation, False)
+    def initial_inference(self, observation: torch.Tensor) -> ModelOutput:
+        encoded_state = self.encode_state(observation)
+        policy, value = self.prediction_network(encoded_state)
         model_output = ModelOutput(value, 0, policy, encoded_state)
         return model_output
 
-    def recurrent_inference(self, encoded_state: torch.Tensor, action: np.ndarray, train: bool = False) -> ModelOutput:
-        if train:
-            reward, next_encoded_state, policy, value = self._recurrent_inference(
-                encoded_state, action, True)
-        else:
-            with torch.no_grad():
-                reward, next_encoded_state, policy, value = self._recurrent_inference(
-                    encoded_state, action, False)
-                reward = reward.detach().numpy()
-
+    def recurrent_inference(self, encoded_state: torch.Tensor, action: torch.Tensor) -> ModelOutput:
+        dynamics_input = torch.cat([encoded_state.T, action.T]).T
+        reward, next_encoded_state = self.dynamics_network(dynamics_input)
+        policy, value = self.prediction_network(encoded_state)
         model_output = ModelOutput(value, reward, policy, next_encoded_state)
         return model_output
 
-    def predict_unroll(self, observations: Union[torch.Tensor, np.ndarray], actions: List[Union[torch.Tensor, np.ndarray]], train: bool = False):
+    def _predict_unroll(self, observation: torch.Tensor, actions: List[torch.Tensor]) -> List[ModelOutput]:
         predictions = []
-        model_output = self.initial_inference(observations, train=train)
+        model_output = self.initial_inference(observation)
         predictions.append(model_output)
 
-        for action in actions:
+        for k in range(self.num_unroll):
             model_output = self.recurrent_inference(
-                model_output.encoded_state, action, train=train)
+                model_output.encoded_state, actions[k])
             predictions.append(model_output)
 
-        predictions = [(i.value, i.reward, i.policy) for i in predictions]
+        return predictions
+
+    def predict_unroll(self, observation: torch.Tensor, actions: List[torch.Tensor], train: bool = False) -> List[ModelOutput]:
+
+        if train:
+            predictions = self._predict_unroll(observation, actions)
+        else:
+            with torch.no_grad():
+                predictions = self._predict_unroll(observation, actions)
         return predictions
 
 
-def update_weights(batch, model: Model, optimizer) -> Tuple[float, float, float]:
+def update_weights(model: MuModel, batch: Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor], optimizer) -> Tuple[float, float, float]:
     model.train()
+    obvservations, actions, targets = batch
+
+    mse, smcel = F.mse_loss, nn.BCEWithLogitsLoss()
+    predictions = model.predict_unroll(obvservations, actions, train=True)
+
     value_loss, reward_loss, policy_loss = 0, 0, 0
-
-    mse_loss = F.mse_loss
-    bce_loss = nn.BCEWithLogitsLoss()
-
-    observations, actions, targets = batch
-    predictions = model.predict_unroll(observations, actions, train=True)
     for i in range(len(predictions)):
-        values, rewards, polices = predictions[i]
-        target_values, target_rewards, target_polices = targets[i]
+        target_values, target_rewards, target_policies = targets[i]
 
-        value_loss += mse_loss(values, target_values)
-        policy_loss += bce_loss(polices, target_polices)
+        value_loss += mse(predictions[i].value, target_values)
+        policy_loss += smcel(predictions[i].policy, target_policies)
         if i > 0:
-            reward_loss += mse_loss(rewards, target_rewards)
-    total_loss = value_loss + reward_loss + policy_loss
+            reward_loss += mse(predictions[i].reward, target_rewards)
 
+    total_loss = value_loss + reward_loss + policy_loss
     optimizer.zero_grad()
     total_loss.backward()
     optimizer.step()
-    model.eval()
 
+    model.eval()
     return value_loss.item(), reward_loss.item(), policy_loss.item()
