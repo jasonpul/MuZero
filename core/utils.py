@@ -51,3 +51,7 @@ def naive_search(model: MuModel, observation: np.ndarray, temperature: float = 1
         policy[idx] += values[i, 0]
     policy = softmax(policy / temperature)
     return policy
+
+
+def mcts():
+    pass
